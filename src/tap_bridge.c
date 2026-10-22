@@ -176,8 +176,13 @@ static void fix_ip_checksum(uint8_t *frame)
 static int write_frame(int fd, const uint8_t *data, uint16_t len, int is_fifo)
 {
     if (is_fifo) {
-        if (write_exact(fd, &len, 2) < 0 ||
-            write_exact(fd, data, len) < 0)
+        /* One write for [len][frame]: two separate ones could leave a length
+         * in the FIFO with no frame behind it if the second hits EAGAIN. */
+        uint8_t rec[2 + RELAY_BUF_MAX];
+        if (len > RELAY_BUF_MAX) return 0;
+        memcpy(rec, &len, 2);
+        memcpy(rec + 2, data, len);
+        if (write_exact(fd, rec, 2 + (size_t)len) < 0)
             return 0;
     } else {
         if (tap_write(data, len) != (ssize_t)len)
@@ -242,16 +247,45 @@ static int replicate_mcast_to_bcast(int write_fd, const uint8_t *frame, uint16_t
     return count;
 }
 
+/* Once part of a [len][frame] record has crossed a non-blocking FIFO, the rest
+ * must follow: giving up would leave the reader mid-record and desync the
+ * stream for good. Linux hides this (pipe I/O up to PIPE_BUF = 4096 bytes is
+ * all-or-nothing), but macOS's PIPE_BUF is 512, so a 1514-byte frame is
+ * routinely split. Wait for the FIFO instead, up to FIFO_STALL_MS in total. */
+#define FIFO_STALL_MS 5000
+
+static int wait_fifo(int fd, int for_write, int *budget_ms)
+{
+    while (*budget_ms > 0) {
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(fd, &fds);
+        struct timeval tv = { .tv_sec = 0, .tv_usec = 100000 };
+        int r = select(fd + 1, for_write ? NULL : &fds, for_write ? &fds : NULL, NULL, &tv);
+        if (r > 0) return 0;
+        if (r < 0 && errno != EINTR) return -1;
+        *budget_ms -= 100;
+    }
+    errno = EIO;
+    return -1;
+}
+
 /* Write exactly n bytes. If fd is non-blocking, returns -1 with EAGAIN
- * when the pipe cannot accept the whole buffer right now. */
+ * when the pipe cannot accept any of the buffer right now; a write that has
+ * started is always finished (see wait_fifo). */
 static int write_exact(int fd, const void *buf, size_t n)
 {
     size_t done = 0;
+    int budget = FIFO_STALL_MS;
     while (done < n) {
         ssize_t w = write(fd, (const char *)buf + done, n - done);
         if (w < 0) {
             if (errno == EINTR)
                 continue;
+            if ((errno == EAGAIN || errno == EWOULDBLOCK) && done > 0) {
+                if (wait_fifo(fd, 1, &budget) < 0) return -1;
+                continue;
+            }
             return -1;
         }
         if (w == 0) return -1;
@@ -495,11 +529,18 @@ static void create_fifos(void)
 static int read_exact(int fd, void *buf, size_t n)
 {
     size_t done = 0;
+    int budget = FIFO_STALL_MS;
     while (done < n) {
         ssize_t r = read(fd, (char *)buf + done, n - done);
         if (r < 0) {
             if (errno == EINTR)
                 continue;
+            /* The writer is mid-record (see wait_fifo): wait for the rest
+             * rather than dropping the bytes already consumed. */
+            if ((errno == EAGAIN || errno == EWOULDBLOCK) && done > 0) {
+                if (wait_fifo(fd, 0, &budget) < 0) return -1;
+                continue;
+            }
             return -1;
         }
         if (r == 0) return -1;
