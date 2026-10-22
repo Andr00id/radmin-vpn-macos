@@ -29,6 +29,22 @@
 #define RADMIN_DESC  L"Famatech Radmin VPN Ethernet Adapter"
 #define RADMIN_FRIENDLY L"Radmin VPN"
 
+/* Host interface name of our TAP. Linux names it radminvpn0; macOS cannot name
+ * interfaces freely, so run_macos.sh exports RVPN_TAP_NAME=feth26 (Wine passes
+ * the Unix environment through) and the same PE build serves both hosts. */
+static const WCHAR *tap_desc(void)
+{
+    static WCHAR name[64];
+    static BOOL init = FALSE;
+    if (!init) {
+        DWORD n = GetEnvironmentVariableW(L"RVPN_TAP_NAME", name, 64);
+        if (n == 0 || n >= 64)
+            lstrcpyW(name, TAP_DESC);
+        init = TRUE;
+    }
+    return name;
+}
+
 /* ====== Logging ====== */
 
 static void dbg(const char *msg)
@@ -477,7 +493,8 @@ static ULONG WINAPI hook_GetAdaptersAddresses(
     /* Pass 1: rename our TAP, learn its IfIndex, and confirm the default-route
      * interface is actually one of the enumerated (non-TAP) adapters. */
     for (PIP_ADAPTER_ADDRESSES cur = Addrs; cur; cur = cur->Next) {
-        if (cur->Description && wcscmp(cur->Description, TAP_DESC) == 0) {
+        if ((cur->Description && wcscmp(cur->Description, tap_desc()) == 0) ||
+            (cur->FriendlyName && wcscmp(cur->FriendlyName, tap_desc()) == 0)) {
             /* Read-only string literals: the caller frees the whole buffer in one
              * shot and never touches these fields individually. */
             cur->Description  = (WCHAR *)RADMIN_DESC;

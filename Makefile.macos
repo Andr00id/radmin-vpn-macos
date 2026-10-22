@@ -1,0 +1,69 @@
+# Makefile.macos - build for macOS: make -f Makefile.macos
+#
+# Native: tap_bridge (clang). Wine side: the same PE files as on Linux, cross-
+# compiled with Homebrew's mingw-w64 (brew install mingw-w64).
+#
+# Not built here: the LD_PRELOAD shims (rvpn_reuseport is unnecessary on macOS,
+# wineserver already sets SO_REUSEPORT there; rvpn_dnsfix targets glibc) and the
+# GTK filter UI (its iptables/ebtables backend is Linux-only).
+
+CC       = clang
+CFLAGS   = -Wall -O2
+BUILD    = build
+
+MINGW32  = i686-w64-mingw32-gcc
+MINGW64  = x86_64-w64-mingw32-gcc
+STRIP32  = i686-w64-mingw32-strip
+STRIP64  = x86_64-w64-mingw32-strip
+
+MINGW_PREFIX := $(shell brew --prefix mingw-w64 2>/dev/null)
+DDK_INC  := $(firstword $(wildcard \
+    $(MINGW_PREFIX)/toolchain-x86_64/x86_64-w64-mingw32/include/ddk \
+    $(MINGW_PREFIX)/toolchain-x86_64/include/ddk))
+
+BINS = $(BUILD)/tap_bridge $(BUILD)/rvpnnetmp.sys $(BUILD)/adapter_hook.dll \
+       $(BUILD)/rvpn_launcher.exe $(BUILD)/netsh.exe $(BUILD)/netsh64.exe \
+       $(BUILD)/drvinst.exe
+
+all: check-deps $(BINS)
+	$(STRIP64) -s $(BUILD)/rvpnnetmp.sys $(BUILD)/netsh64.exe
+	$(STRIP32) -s $(BUILD)/adapter_hook.dll $(BUILD)/rvpn_launcher.exe $(BUILD)/netsh.exe $(BUILD)/drvinst.exe
+
+# Only the native bridge; enough to test the feth plumbing without mingw.
+bridge: $(BUILD)/tap_bridge
+
+$(BUILD)/tap_bridge: src/tap_bridge.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $< -lpthread
+
+$(BUILD)/rvpnnetmp.sys: src/rvpnnetmp.c | $(BUILD)
+	$(MINGW64) -shared -o $@ $< -I$(DDK_INC) \
+		-lntoskrnl -lhal -nostdlib -lgcc \
+		-Wl,--subsystem,native -Wl,--entry,DriverEntry
+
+$(BUILD)/adapter_hook.dll: src/adapter_hook.c | $(BUILD)
+	$(MINGW32) -shared -o $@ $< -liphlpapi -lws2_32 -lole32 -Wl,--enable-stdcall-fixup
+
+$(BUILD)/rvpn_launcher.exe: src/rvpn_launcher.c | $(BUILD)
+	$(MINGW32) $(CFLAGS) -o $@ $<
+
+$(BUILD)/netsh.exe: src/netsh_wrapper.c | $(BUILD)
+	$(MINGW32) $(CFLAGS) -o $@ $< -municode
+
+$(BUILD)/netsh64.exe: src/netsh_wrapper.c | $(BUILD)
+	$(MINGW64) $(CFLAGS) -o $@ $< -municode
+
+$(BUILD)/drvinst.exe: src/drvinst.c | $(BUILD)
+	$(MINGW32) $(CFLAGS) -o $@ $<
+
+$(BUILD):
+	mkdir -p $(BUILD)
+
+check-deps:
+	@command -v $(MINGW32) >/dev/null || { echo "Missing mingw-w64: brew install mingw-w64"; exit 1; }
+	@command -v $(MINGW64) >/dev/null || { echo "Missing mingw-w64: brew install mingw-w64"; exit 1; }
+	@[ -n "$(DDK_INC)" ] || { echo "mingw-w64 DDK headers not found under $(MINGW_PREFIX)"; exit 1; }
+
+clean:
+	rm -rf $(BUILD)
+
+.PHONY: all bridge check-deps clean

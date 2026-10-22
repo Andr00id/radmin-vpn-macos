@@ -17,9 +17,15 @@
  * Dual-threading eliminates head-of-line blocking: a stalled b2d write cannot
  * delay incoming frames arriving from the driver.
  *
+ * macOS has no TAP device. There the "TAP" is a pair of fake ethernet (feth)
+ * interfaces peered back to back, the same trick ZeroTier uses: the host stack
+ * sees the first one (address, routes, ARP) and every frame it sends comes out
+ * of the second, where we read it with BPF and inject replies with an AF_NDRV
+ * socket. Both need root, so on macOS the bridge runs under sudo.
+ *
  * Build: gcc -Wall -O2 -o tap_bridge tap_bridge.c -lpthread
- * Usage: sudo ./tap_bridge <vpn-ip> [netmask-bits]
- *   e.g.: sudo ./tap_bridge 26.145.88.170 8
+ * Usage: ./tap_bridge [tap-name]                 (Linux, default radminvpn0)
+ *        sudo ./tap_bridge [host-feth] [peer-feth]  (macOS, default feth26 feth5026)
  */
 
 #define _GNU_SOURCE
@@ -38,9 +44,14 @@
 #include <sys/stat.h>
 #include <sys/select.h>
 #include <net/if.h>
-#include <linux/if_tun.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#ifdef __APPLE__
+#include <net/bpf.h>
+#include <net/ndrv.h>
+#else
+#include <linux/if_tun.h>
+#endif
 
 /* ── Filter config (read from /tmp/rvpn_filters.json) ── */
 #define FILTER_PATH    "/tmp/rvpn_filters.json"
@@ -84,8 +95,13 @@ static int               g_have_local_ip = 0;
 
 static pthread_mutex_t g_arp_lock = PTHREAD_MUTEX_INITIALIZER;
 
+#ifdef __APPLE__
+#define TAP_DEV_NAME    "feth26"     /* host side: gets the 26.x address */
+#define TAP_PEER_NAME   "feth5026"   /* bridge side: BPF read, NDRV write */
+#else
 #define TAP_DEV_NAME    "radminvpn0"
-#define FIFO_B2D        "/tmp/rvpn_b2d"
+#endif
+#define FIFO_B2D       "/tmp/rvpn_b2d"
 #define FIFO_D2B_HIGH   "/tmp/rvpn_d2b_high"
 #define FIFO_D2B_LOW    "/tmp/rvpn_d2b_low"
 #define MTU             1500
@@ -114,8 +130,13 @@ static volatile uint32_t  g_retry_tail = 0;
 
 static volatile int running = 1;
 
-/* Global file descriptors, set once in main() and read-only by the threads. */
+/* Global file descriptors, set once in main() and read-only by the threads.
+ * g_tap_fd is what outgoing_thread selects on; on macOS it is the BPF reader
+ * and frames toward the host go out through g_ndrv_fd instead. */
 static int g_tap_fd = -1;
+#ifdef __APPLE__
+static int g_ndrv_fd = -1;
+#endif
 static int g_b2d_fd = -1;
 static int g_d2b_high_fd = -1;
 static int g_d2b_low_fd = -1;
@@ -132,8 +153,9 @@ static void sig_handler(int sig)
     __atomic_store_n(&running, 0, __ATOMIC_SEQ_CST);
 }
 
-/* Forward declaration */
+/* Forward declarations */
 static int write_exact(int fd, const void *buf, size_t n);
+static ssize_t tap_write(const void *frame, size_t len);
 
 /* Recalculate IP header checksum for a frame (eth + IP header) */
 static void fix_ip_checksum(uint8_t *frame)
@@ -149,7 +171,8 @@ static void fix_ip_checksum(uint8_t *frame)
     frame[25] = csum & 0xFF;
 }
 
-/* Write a frame to either FIFO ([len16][frame]) or TAP (raw frame) */
+/* Write a frame to either FIFO ([len16][frame]) or TAP (raw frame).
+ * For the TAP, fd is ignored: tap_write knows the device. */
 static int write_frame(int fd, const uint8_t *data, uint16_t len, int is_fifo)
 {
     if (is_fifo) {
@@ -157,7 +180,7 @@ static int write_frame(int fd, const uint8_t *data, uint16_t len, int is_fifo)
             write_exact(fd, data, len) < 0)
             return 0;
     } else {
-        if (write_exact(fd, data, len) < 0)
+        if (tap_write(data, len) != (ssize_t)len)
             return 0;
     }
     return 1;
@@ -284,11 +307,127 @@ static int retry_ring_flush(void)
     return 0;
 }
 
+#ifdef __APPLE__
+
+/* BPF hands back a buffer of several [bpf_hdr][frame] records per read().
+ * tap_read() walks it one frame at a time; select() will not fire for frames
+ * already sitting in the buffer, hence tap_has_buffered(). Only
+ * outgoing_thread reads, so no locking. */
+static uint8_t *g_bpf_buf = NULL;
+static size_t   g_bpf_buflen = 0;
+static size_t   g_bpf_off = 0, g_bpf_end = 0;
+
+/* Open a BPF reader on the peer feth: everything the host sends out of the
+ * host feth arrives here as input. SEESENT=0 keeps our own NDRV injections out. */
+static int open_bpf(const char *ifname)
+{
+    int fd = -1;
+    for (int i = 0; i < 256; i++) {
+        char path[32];
+        snprintf(path, sizeof(path), "/dev/bpf%d", i);
+        fd = open(path, O_RDWR);
+        if (fd >= 0 || errno != EBUSY) break;
+    }
+    if (fd < 0) { perror("open /dev/bpf*"); return -1; }
+
+    u_int blen = 512 * 1024;
+    ioctl(fd, BIOCSBLEN, &blen);  /* must precede BIOCSETIF; kernel may clamp */
+
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    strlcpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name));
+    if (ioctl(fd, BIOCSETIF, &ifr) < 0) {
+        fprintf(stderr, "tap_bridge: BIOCSETIF %s: %s\n", ifname, strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    u_int one = 1, zero = 0;
+    if (ioctl(fd, BIOCIMMEDIATE, &one) < 0) perror("tap_bridge: BIOCIMMEDIATE");
+    if (ioctl(fd, BIOCSSEESENT, &zero) < 0) perror("tap_bridge: BIOCSSEESENT");
+    if (ioctl(fd, BIOCSHDRCMPLT, &one) < 0) perror("tap_bridge: BIOCSHDRCMPLT");
+    /* Frames are addressed to peer MACs, not to this feth's own. */
+    if (ioctl(fd, BIOCPROMISC, NULL) < 0) perror("tap_bridge: BIOCPROMISC");
+
+    if (ioctl(fd, BIOCGBLEN, &blen) < 0) { perror("BIOCGBLEN"); close(fd); return -1; }
+    g_bpf_buf = malloc(blen);
+    if (!g_bpf_buf) { close(fd); return -1; }
+    g_bpf_buflen = blen;
+    return fd;
+}
+
+/* Open an AF_NDRV socket on the peer feth: a frame written here is transmitted
+ * out of the peer and received by the host feth as if it came off the wire. */
+static int open_ndrv(const char *ifname)
+{
+    int s = socket(AF_NDRV, SOCK_RAW, 0);
+    if (s < 0) { perror("socket AF_NDRV"); return -1; }
+
+    struct sockaddr_ndrv nd;
+    memset(&nd, 0, sizeof(nd));
+    nd.snd_len = sizeof(nd);
+    nd.snd_family = AF_NDRV;
+    strlcpy((char *)nd.snd_name, ifname, sizeof(nd.snd_name));
+    if (bind(s, (struct sockaddr *)&nd, sizeof(nd)) < 0 ||
+        connect(s, (struct sockaddr *)&nd, sizeof(nd)) < 0) {
+        fprintf(stderr, "tap_bridge: NDRV bind %s: %s\n", ifname, strerror(errno));
+        close(s);
+        return -1;
+    }
+    int sndbuf = 1024 * 1024;
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+    return s;
+}
+
+/* The feth pair itself (create, peer, lladdr, up) is set up by run_macos.sh. */
+static int open_tap(const char *dev_name, const char *peer_name)
+{
+    int fd = open_bpf(peer_name);
+    if (fd < 0) return -1;
+    g_ndrv_fd = open_ndrv(peer_name);
+    if (g_ndrv_fd < 0) { close(fd); return -1; }
+    fprintf(stderr, "tap_bridge: attached to '%s' via peer '%s' (bpf=%d ndrv=%d)\n",
+            dev_name, peer_name, fd, g_ndrv_fd);
+    return fd;
+}
+
+static ssize_t tap_write(const void *frame, size_t len)
+{
+    ssize_t w;
+    do { w = send(g_ndrv_fd, frame, len, 0); } while (w < 0 && errno == EINTR);
+    return w;
+}
+
+/* Returns the next frame's length, 0 for a frame that was skipped (truncated
+ * capture or larger than cap), or the read() result when the buffer was empty. */
+static ssize_t tap_read(uint8_t *out, size_t cap)
+{
+    if (g_bpf_off >= g_bpf_end) {
+        ssize_t n = read(g_tap_fd, g_bpf_buf, g_bpf_buflen);
+        if (n <= 0) return n;
+        g_bpf_off = 0;
+        g_bpf_end = (size_t)n;
+    }
+    const struct bpf_hdr *h = (const struct bpf_hdr *)(g_bpf_buf + g_bpf_off);
+    const uint8_t *pkt = g_bpf_buf + g_bpf_off + h->bh_hdrlen;
+    size_t caplen = h->bh_caplen;
+    g_bpf_off += BPF_WORDALIGN(h->bh_hdrlen + h->bh_caplen);
+    if (caplen != h->bh_datalen || caplen > cap)
+        return 0;
+    memcpy(out, pkt, caplen);
+    return (ssize_t)caplen;
+}
+
+static int tap_has_buffered(void) { return g_bpf_off < g_bpf_end; }
+
+#else /* Linux */
+
 /* Open/attach to the TAP device
  * Creates or attaches to an existing TAP device for ethernet frame I/O.
  * IFF_NO_PI: no packet information header (we want raw ethernet frames) */
-static int open_tap(const char *dev_name)
+static int open_tap(const char *dev_name, const char *peer_name)
 {
+    (void)peer_name;
     struct ifreq ifr;
     int fd = open("/dev/net/tun", O_RDWR);
     if (fd < 0) { perror("open /dev/net/tun"); return -1; }
@@ -306,6 +445,31 @@ static int open_tap(const char *dev_name)
     return fd;
 }
 
+static ssize_t tap_write(const void *frame, size_t len)
+{
+    return write(g_tap_fd, frame, len);
+}
+
+static ssize_t tap_read(uint8_t *out, size_t cap)
+{
+    return read(g_tap_fd, out, cap);
+}
+
+static int tap_has_buffered(void) { return 0; }
+
+#endif
+
+/* When run as root through sudo (always the case on macOS), hand the FIFOs to
+ * the invoking user: Wine runs as that user and must be able to open them,
+ * and mkfifo's 0666 is cut down by root's umask. */
+static void give_fifo_to_sudo_user(const char *path)
+{
+    const char *uid = getenv("SUDO_UID"), *gid = getenv("SUDO_GID");
+    if (geteuid() != 0 || !uid || !gid) return;
+    if (chown(path, (uid_t)atoi(uid), (gid_t)atoi(gid)) < 0)
+        fprintf(stderr, "tap_bridge: chown %s: %s\n", path, strerror(errno));
+}
+
 /* Create named pipes for communication with Wine driver
  * FIFO_B2D:       bridge-to-driver (TAP → Wine): bridge writes, driver reads
  * FIFO_D2B_HIGH:  driver-to-bridge high priority (Wine → TAP)
@@ -318,6 +482,9 @@ static void create_fifos(void)
     mkfifo(FIFO_B2D, 0666);
     mkfifo(FIFO_D2B_HIGH, 0666);
     mkfifo(FIFO_D2B_LOW, 0666);
+    give_fifo_to_sudo_user(FIFO_B2D);
+    give_fifo_to_sudo_user(FIFO_D2B_HIGH);
+    give_fifo_to_sudo_user(FIFO_D2B_LOW);
     fprintf(stderr, "tap_bridge: FIFOs created: %s, %s, %s\n",
             FIFO_B2D, FIFO_D2B_HIGH, FIFO_D2B_LOW);
 }
@@ -580,6 +747,9 @@ static void detect_local_ip(const char *ifname)
 static void inject_gratuitous_arp(const uint8_t ip[4], const uint8_t mac[6])
 {
     if (g_tap_fd < 0) return;
+#ifdef __APPLE__
+    if (g_ndrv_fd < 0) return;
+#endif
 
     uint8_t garp[60];
     memset(garp, 0, sizeof(garp));
@@ -600,7 +770,7 @@ static void inject_gratuitous_arp(const uint8_t ip[4], const uint8_t mac[6])
     memcpy(garp + 32, mac, 6);        /* target MAC */
     memcpy(garp + 38, ip, 4);         /* target IP */
 
-    if (write(g_tap_fd, garp, 60) == 60) {
+    if (tap_write(garp, 60) == 60) {
         g_arp_replies_sent++;
         fprintf(stderr, "tap_bridge: gratuitous ARP for %u.%u.%u.%u -> "
                 "%02x:%02x:%02x:%02x:%02x:%02x\n",
@@ -681,9 +851,9 @@ static int arp_cache_lookup(const uint8_t ip[4], uint8_t out_mac[6])
     return 0;
 }
 
-/* If frame is an ARP request whose target IP is in cache, inject reply on tap_fd.
+/* If frame is an ARP request whose target IP is in cache, inject reply into the TAP.
  * Caller must hold g_arp_lock. */
-static int try_arp_reply(int tap_fd, const uint8_t *frame, uint16_t len)
+static int try_arp_reply(const uint8_t *frame, uint16_t len)
 {
     if (len < 42) return 0;
     if (frame[12] != 0x08 || frame[13] != 0x06) return 0;  /* not ARP */
@@ -712,7 +882,7 @@ static int try_arp_reply(int tap_fd, const uint8_t *frame, uint16_t len)
     memcpy(reply + 32, frame + 6, 6);   /* target MAC = requester */
     memcpy(reply + 38, frame + 28, 4);  /* target IP = requester IP */
 
-    if (write(tap_fd, reply, 60) == 60) {
+    if (tap_write(reply, 60) == 60) {
         g_arp_replies_sent++;
         if (g_arp_replies_sent <= 5 || (g_arp_replies_sent % 50) == 0)
             fprintf(stderr, "tap_bridge: ARP reply #%lu for %u.%u.%u.%u\n",
@@ -762,7 +932,7 @@ static int process_incoming_frame(int fd, uint8_t *buf, uint16_t *out_len)
     if (drop)
         return 0;
 
-    if (write(g_tap_fd, buf, len) != (ssize_t)len) {
+    if (tap_write(buf, len) != (ssize_t)len) {
         if (errno == EAGAIN || errno == EWOULDBLOCK)
             return 0;
         perror("tap_bridge: write to TAP");
@@ -866,29 +1036,32 @@ static void *outgoing_thread(void *arg)
             break;
         }
 
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(g_tap_fd, &rfds);
+        /* Frames left over from the last BPF read (macOS) need no select. */
+        if (!tap_has_buffered()) {
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(g_tap_fd, &rfds);
 
-        struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
-        int ret = select(g_tap_fd + 1, &rfds, NULL, NULL, &tv);
-        if (ret < 0) {
-            if (errno == EINTR) continue;
-            perror("tap_bridge: outgoing select");
-            __atomic_store_n(&running, 0, __ATOMIC_SEQ_CST);
-            break;
+            struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+            int ret = select(g_tap_fd + 1, &rfds, NULL, NULL, &tv);
+            if (ret < 0) {
+                if (errno == EINTR) continue;
+                perror("tap_bridge: outgoing select");
+                __atomic_store_n(&running, 0, __ATOMIC_SEQ_CST);
+                break;
+            }
+            if (ret == 0) {
+                pthread_rwlock_wrlock(&g_filter_lock);
+                load_filters_internal();
+                pthread_rwlock_unlock(&g_filter_lock);
+                continue;
+            }
+
+            if (!FD_ISSET(g_tap_fd, &rfds))
+                continue;
         }
-        if (ret == 0) {
-            pthread_rwlock_wrlock(&g_filter_lock);
-            load_filters_internal();
-            pthread_rwlock_unlock(&g_filter_lock);
-            continue;
-        }
 
-        if (!FD_ISSET(g_tap_fd, &rfds))
-            continue;
-
-        ssize_t n = read(g_tap_fd, buf, sizeof(buf));
+        ssize_t n = tap_read(buf, sizeof(buf));
         if (n <= 0) {
             if (n < 0 && errno == EINTR) continue;
             if (n < 0) perror("tap_bridge: read TAP");
@@ -900,7 +1073,7 @@ static void *outgoing_thread(void *arg)
         pthread_mutex_lock(&g_arp_lock);
         if (len >= 42 && buf[12] == 0x08 && buf[13] == 0x06)
             arp_cache_update(buf + 28, buf + 22);
-        try_arp_reply(g_tap_fd, buf, len);
+        try_arp_reply(buf, len);
         pthread_mutex_unlock(&g_arp_lock);
 
         pthread_rwlock_rdlock(&g_filter_lock);
@@ -940,18 +1113,24 @@ static void *outgoing_thread(void *arg)
 
 int main(int argc, char *argv[])
 {
-    (void)argc; (void)argv;
+    const char *dev_name = argc > 1 ? argv[1] : TAP_DEV_NAME;
+#ifdef __APPLE__
+    const char *peer_name = argc > 2 ? argv[2] : TAP_PEER_NAME;
+#else
+    const char *peer_name = NULL;
+#endif
 
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
     signal(SIGPIPE, SIG_IGN);
 
-    /* Attach to existing TAP (created by run.sh with ip tuntap add) */
-    int tap_fd = open_tap(TAP_DEV_NAME);
+    /* Attach to existing TAP (created by run.sh with ip tuntap add, or the
+     * feth pair created by run_macos.sh) */
+    int tap_fd = open_tap(dev_name, peer_name);
     if (tap_fd < 0) return 1;
     g_tap_fd = tap_fd;
 
-    detect_local_ip(TAP_DEV_NAME);
+    detect_local_ip(dev_name);
 
     /* Create FIFOs */
     create_fifos();
@@ -962,13 +1141,17 @@ int main(int argc, char *argv[])
      * matching write ends without blocking when it starts up. */
     int d2b_high_fd = open(FIFO_D2B_HIGH, O_RDONLY | O_NONBLOCK);
     if (d2b_high_fd < 0) { perror("open d2b_high"); close(tap_fd); return 1; }
+#ifdef F_SETPIPE_SZ  /* Linux only; macOS pipes grow to 64 KiB on their own */
     if (fcntl(d2b_high_fd, F_SETPIPE_SZ, 256 * 1024) < 0)
         perror("tap_bridge: fcntl high pipe size");
+#endif
 
     int d2b_low_fd = open(FIFO_D2B_LOW, O_RDONLY | O_NONBLOCK);
     if (d2b_low_fd < 0) { perror("open d2b_low"); close(tap_fd); close(d2b_high_fd); return 1; }
+#ifdef F_SETPIPE_SZ
     if (fcntl(d2b_low_fd, F_SETPIPE_SZ, 1024 * 1024) < 0)
         perror("tap_bridge: fcntl low pipe size");
+#endif
 
     int b2d_fd = open(FIFO_B2D, O_WRONLY);
     if (b2d_fd < 0) { perror("open b2d"); close(tap_fd); close(d2b_high_fd); close(d2b_low_fd); return 1; }
