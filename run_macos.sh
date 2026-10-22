@@ -280,6 +280,9 @@ destroy_feth() {   # -n: never hang on a password prompt with no tty
 HAVE_SUDO=0   # cleanup only touches root state once sudo was primed
 
 cleanup() {
+    # Best effort, every step: after the Terminal window closes the first echo
+    # fails with EIO, and under set -e that silently skipped all the rest.
+    set +e
     # A dying service during teardown must not look like a crash to restart.
     trap '' USR1
     [ -n "$WATCHDOG_PID" ] && kill "$WATCHDOG_PID" 2>/dev/null || true
@@ -379,7 +382,9 @@ SUDO_KEEPALIVE_PID=$!; disown
 # waiting on.
 if [ -z "${RVPN_GUARD_STARTED:-}" ]; then
     mkdir -p "$STATE_DIR"
+    if [ "$USE_CROSSOVER" -eq 1 ]; then _ws="$CX_ROOT/bin/wineserver"; else _ws=$(command -v wineserver || true); fi
     sudo -b /bin/bash "$DIR/macos_guard.sh" $$ "$ROUTES_STATE" "$TAP_DEV" "$TAP_PEER" \
+        "$_ws" "$WINEPREFIX" \
         </dev/null >/dev/null 2>&1 || warn "could not start macos_guard.sh — cleanup needs this terminal open"
     export RVPN_GUARD_STARTED=1
 fi
