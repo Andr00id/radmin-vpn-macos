@@ -11,10 +11,11 @@
 # as one: the host gets the 26.x address on feth26, and every frame it sends
 # there comes out of feth5026, where tap_bridge picks it up.
 #
-# Wine: any Wine >= 11 for macOS. Looked up in this order: $WINE_BIN_DIR,
-# CrossOver (bottle "RadminVPN"), `wine` on PATH, Gcenx's "Wine
-# Devel/Staging/Stable.app" in /Applications. All of them run x86_64 code, so
-# Apple Silicon needs Rosetta 2.
+# Wine: free Wine by default — $WINE_BIN_DIR, `wine` on PATH, Gcenx's "Wine
+# Devel/Staging/Stable.app" in /Applications or ~/Applications, or the pinned
+# Wine Devel this script downloads on first run. CrossOver only on request
+# (RVPN_WINE=crossover). All of them run x86_64 code, so Apple Silicon needs
+# Rosetta 2.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -24,56 +25,120 @@ ORIG_ARGS=("$@")
 
 source "$DIR/lib.sh"
 
+# Everything that must outlive an update of this folder: downloads, the Wine
+# prefix (with your Radmin ID), the bundled Wine.
+DATA_DIR="${RADMIN_DATA_DIR:-$HOME/Library/Application Support/radmin-vpn-macos}"
+DOWNLOAD_DIR="$DATA_DIR"
+
+BUILD_DIR="${BUILD_DIR:-$DIR/build}"
+
+# A release archive downloaded with a browser carries the quarantine flag onto
+# every file it unpacks, and Gatekeeper then refuses to run build/tap_bridge.
+# Only our own folder is touched.
+xattr -dr com.apple.quarantine "$DIR" 2>/dev/null || true
+
+# ── Pinned downloads ──────────────────────────────────────────────────────────
+# Wine Devel for macOS (Gcenx). We run our own copy of it, in $DATA_DIR/wine,
+# with build/wow64cpu.dll swapped in (see src/wow64cpu/cpu.c: upstream Wine's
+# 32<->64-bit switch misbehaves under Rosetta and kills every 32-bit program
+# with a window — Radmin's GUI and its installer).
+WINE_VERSION="wine-11.18"
+WINE_PKG_URL="https://github.com/Gcenx/macOS_Wine_builds/releases/download/11.18/wine-devel-11.18-osx64.tar.xz"
+WINE_PKG_SHA256="aa0ea4c82e636ae7bca2076387cb0a5affa26509ad13f119ecd0d62bd7ba6f82"
+# innounp (Inno Setup unpacker, jrathlev/InnoUnpacker-Windows-GUI): pulls the
+# MSI out of Radmin's installer, which we then install with Wine's own msiexec
+# — no Inno Setup wizard, no GUI at all during installation.
+INNOUNP_URL="https://github.com/jrathlev/InnoUnpacker-Windows-GUI/releases/download/ui_2_2_13/innounp-2.zip"
+INNOUNP_SHA256="10fce27b6344b7674d5625cc34afca1c88c12183d957c6d93e401097fa2556cd"
+# The MSI inside Radmin_VPN_2.1.4951.1.exe (pairs with RADMIN_SHA256_PINNED).
+RADMIN_MSI_SHA256_PINNED="2297709bea978cef39c1c6124c6bb16a20125b64e2be5ef470bc9d0429d4bda3"
+
+# Download $1 to $2 and check its sha256 ($3); removes the file on mismatch.
+_fetch_verified() {
+    local url="$1" dest="$2" want="$3" got
+    curl -fL --retry 3 --progress-bar -o "$dest.part" "$url" || { rm -f "$dest.part"; return 1; }
+    got=$(_sha256_of "$dest.part")
+    if [ "$got" != "$want" ]; then
+        rm -f "$dest.part"
+        warn "sha256 mismatch for $url"
+        return 1
+    fi
+    mv "$dest.part" "$dest"
+}
+
 # ── Wine discovery ────────────────────────────────────────────────────────────
 CX_ROOT="/Applications/CrossOver.app/Contents/SharedSupport/CrossOver"
 CX_BOTTLE_NAME="${CX_BOTTLE_NAME:-RadminVPN}"
+CX_BOTTLE_DIR="$HOME/Library/Application Support/CrossOver/Bottles/$CX_BOTTLE_NAME"
 USE_CROSSOVER=0
+WINE_APP="$DATA_DIR/wine/Wine Devel.app"
+WINE_LIB64="$WINE_APP/Contents/Resources/wine/lib/wine/x86_64-windows"
 
-# CrossOver comes first when installed: Gcenx's Wine Devel 11.18 crashes inside
-# Radmin's Inno Setup installer (32-bit SEH under wow64 + Rosetta: "Exception
-# frame is not in stack limits"), CrossOver 26.1 installs it cleanly. Set
-# RVPN_WINE=system to skip CrossOver anyway.
+_wine_app_version() { "$1/Contents/Resources/wine/bin/wine" --version 2>/dev/null | head -n1; }
+
+# Our copy of the pinned Wine: an APFS clone of an identical "Wine Devel.app"
+# already in /Applications (instant, no extra space), else a verified download.
+_provision_wine() {
+    local src tarball="$DATA_DIR/wine-devel.tar.xz"
+    mkdir -p "$DATA_DIR/wine"
+    for src in "/Applications/Wine Devel.app" "$HOME/Applications/Wine Devel.app"; do
+        if [ "$(_wine_app_version "$src")" = "$WINE_VERSION" ]; then
+            say "Copying $src for Radmin VPN's own use..."
+            rm -rf "$WINE_APP"
+            cp -cR "$src" "$WINE_APP" 2>/dev/null || cp -R "$src" "$WINE_APP" \
+                || die "could not copy $src"
+            return 0
+        fi
+    done
+    say "Downloading Wine Devel 11.18 for macOS (~190 MB, once)..."
+    _fetch_verified "$WINE_PKG_URL" "$tarball" "$WINE_PKG_SHA256" \
+        || die "Wine download failed — check the connection and re-run"
+    rm -rf "$WINE_APP"
+    tar -xJf "$tarball" -C "$DATA_DIR/wine" || die "could not unpack $tarball"
+    rm -f "$tarball"
+    [ -x "$WINE_APP/Contents/Resources/wine/bin/wine" ] || die "unexpected layout in the Wine package"
+    good "Wine installed in $DATA_DIR/wine"
+}
+
+# Swap our Rosetta-safe wow64cpu.dll into our Wine copy (idempotent).
+_patch_wine() {
+    local dll="$BUILD_DIR/wow64cpu.dll"
+    [ -f "$dll" ] || die "missing $dll — run 'make -f Makefile.macos' first"
+    cmp -s "$dll" "$WINE_LIB64/wow64cpu.dll" && return 0
+    cp -f "$dll" "$WINE_LIB64/wow64cpu.dll" || die "could not patch $WINE_LIB64"
+    good "Installed the Rosetta-safe wow64cpu.dll into Wine"
+}
+
 _find_wine() {
-    local d app
+    if [ "${RVPN_WINE:-}" = "crossover" ]; then
+        [ -x "$CX_ROOT/bin/wine" ] || die "RVPN_WINE=crossover, but CrossOver is not installed"
+        USE_CROSSOVER=1
+        return 0
+    fi
     if [ -n "${WINE_BIN_DIR:-}" ]; then
+        # Your own Wine, used as is: without our wow64cpu.dll, Radmin's GUI
+        # crashes under Rosetta (the VPN service itself still runs).
         export PATH="$WINE_BIN_DIR:$PATH"
         return 0
     fi
-    if [ "${RVPN_WINE:-}" != "system" ] && [ -x "$CX_ROOT/bin/wine" ]; then
-        USE_CROSSOVER=1
-        return 0
-    fi
-    command -v wine >/dev/null 2>&1 && return 0
-    for app in "Wine Devel" "Wine Staging" "Wine Stable"; do
-        for d in "/Applications/$app.app" "$HOME/Applications/$app.app"; do
-            if [ -x "$d/Contents/Resources/wine/bin/wine" ]; then
-                export PATH="$d/Contents/Resources/wine/bin:$PATH"
-                return 0
-            fi
-        done
-    done
-    if [ -x "$CX_ROOT/bin/wine" ]; then
-        USE_CROSSOVER=1
-        return 0
-    fi
-    return 1
+    [ "$(_wine_app_version "$WINE_APP")" = "$WINE_VERSION" ] || _provision_wine
+    _patch_wine
+    export PATH="$WINE_APP/Contents/Resources/wine/bin:$PATH"
 }
 
-_find_wine || die "Wine not found. Install a Wine >= 11 build for macOS, e.g. from
-    https://github.com/Gcenx/macOS_Wine_builds/releases (Wine Devel.app → /Applications)
-  or point WINE_BIN_DIR at a directory containing wine and wineserver."
+_find_wine
 
 if [ "$USE_CROSSOVER" -eq 1 ]; then
     # CrossOver's `wine` is a wrapper that picks the prefix from CX_BOTTLE;
     # its wineserver is the real binary and wants WINEPREFIX instead.
     export CX_BOTTLE="$CX_BOTTLE_NAME"
-    export WINEPREFIX="$HOME/Library/Application Support/CrossOver/Bottles/$CX_BOTTLE_NAME"
+    export WINEPREFIX="$CX_BOTTLE_DIR"
     wine()       { "$CX_ROOT/bin/wine" "$@"; }
     wineserver() { "$CX_ROOT/bin/wineserver" "$@"; }
     # The wrapper's --version prints CrossOver's own version; the loader has Wine's.
     wine_version_str() { "$CX_ROOT/bin/wineloader" --version 2>/dev/null | head -n1; }
 else
-    export WINEPREFIX="${WINEPREFIX:-$DIR/wineprefix}"
+    export WINEPREFIX="${WINEPREFIX:-$DATA_DIR/wineprefix}"
 fi
 wineboot() { wine wineboot "$@"; }
 
@@ -83,6 +148,24 @@ wine_major() { wine_version_str | sed -nE 's/^wine-([0-9]+).*/\1/p'; }
 # The SO_REUSEPORT shim lib.sh preloads on Linux is not needed here: wineserver
 # sets SO_REUSEPORT itself under __APPLE__ (see src/rvpn_reuseport.c).
 boot_wineserver() { wineserver -p; }
+
+# Stop the prefix's Wine session and wait until it is really gone (capped):
+# -k only asks the server to quit. A wine command started meanwhile attaches
+# to the dying server and stalls, and the server rewrites the registry on its
+# way out over any offline edit made in between.
+wine_stop() {
+    wineserver -k 2>/dev/null || true
+    _timeout 30 wineserver -w 2>/dev/null || true
+}
+
+# RVPN_TIMING=1: show seconds since launch on every status line.
+if [ "${RVPN_TIMING:-0}" = "1" ]; then
+    _T0=$(date +%s)
+    _el() { printf '%4ss' "$(( $(date +%s) - _T0 ))"; }
+    say()  { echo    "[*] $(_el) $1"; }
+    good() { echo -e "${GREEN}[+]${NC} $(_el) $1"; }
+    warn() { echo -e "${YELLOW}[!]${NC} $(_el) $1"; }
+fi
 
 # `timeout` is GNU coreutils and perl's `exec` would bypass the wine() shell
 # function CrossOver needs, so run the command in the background and kill it
@@ -99,14 +182,14 @@ _timeout() {
     local s="$1" p k rc=0; shift
     "$@" & p=$!
     ( sleep "$s"; _kill_tree "$p" ) >/dev/null 2>&1 & k=$!
-    wait "$p" || rc=$?
-    kill "$k" 2>/dev/null || true
+    wait "$p" 2>/dev/null || rc=$?
+    # Stop the killer and its sleep, quietly (bash would report "Terminated").
+    { _kill_tree "$k"; wait "$k"; } 2>/dev/null || true
     return "$rc"
 }
 
 export WINEDEBUG=-all
 RADMIN="$WINEPREFIX/drive_c/Program Files (x86)/Radmin VPN"
-BUILD_DIR="${BUILD_DIR:-$DIR/build}"
 TAP_DEV="feth26"
 TAP_PEER="feth5026"
 CMD_FILE="/tmp/radmin_netsh_cmd"
@@ -124,6 +207,7 @@ STATE_DIR="$HOME/Library/Caches/radmin-vpn-macos"
 ROUTES_STATE="$STATE_DIR/routes.state"
 NO_UI=0
 RETINA=1          # render the GUI at native Retina resolution (--no-retina: Wine's 1x, upscaled)
+FORCE_IMPORT_ID=0 # --import-crossover-id: replace this prefix's Radmin ID with CrossOver's
 SAVED_ROUTES=""   # "dest iface" lines to put back on exit
 
 # adapter_hook.dll matches the host interface by this name (Wine passes the
@@ -140,6 +224,7 @@ while [ $# -gt 0 ]; do
         --installer=*) INSTALLER="${1#*=}"; INSTALLER_EXPLICIT=1 ;;
         --no-ui) NO_UI=1 ;;
         --no-retina) RETINA=0 ;;
+        --import-crossover-id) FORCE_IMPORT_ID=1 ;;
         --no-broadcast-routes) NO_BCAST_ROUTES=1 ;;
         --update) DO_UPDATE=1 ;;
         *) warn "ignoring unknown option $1" ;;
@@ -150,7 +235,6 @@ DO_UPDATE="${DO_UPDATE:-0}"
 NO_BCAST_ROUTES="${NO_BCAST_ROUTES:-0}"
 
 INSTALLER_URL="${RADMIN_INSTALLER_URL:-$(radmin_installer_url)}"
-DOWNLOAD_DIR="${RADMIN_DATA_DIR:-$HOME/Library/Application Support/radmin-vpn-macos}"
 
 ensure_installer() {
     [ -n "$INSTALLER" ] && [ -f "$INSTALLER" ] && return 0
@@ -283,12 +367,14 @@ cleanup() {
     # Best effort, every step: after the Terminal window closes the first echo
     # fails with EIO, and under set -e that silently skipped all the rest.
     set +e
+    # A second launcher refused by the lock must leave the running one alone.
+    [ "${OWN_LOCK:-0}" -eq 1 ] || return 0
     # A dying service during teardown must not look like a crash to restart.
     trap '' USR1
     [ -n "$WATCHDOG_PID" ] && kill "$WATCHDOG_PID" 2>/dev/null || true
     echo
     say "Closing Radmin VPN..."
-    wineserver -k 2>/dev/null || true
+    wine_stop
     [ -n "$RELAY_PID" ] && kill "$RELAY_PID" 2>/dev/null || true
     if [ "$HAVE_SUDO" -eq 1 ]; then
         # Bridge first, so it isn't left reading a destroyed interface.
@@ -306,10 +392,14 @@ cleanup() {
         export RVPN_RESTARTS=$((RVPN_RESTARTS + 1))
         say "Restarting Radmin VPN (attempt $RVPN_RESTARTS of $MAX_RESTARTS)..."
         # Same PID, so the keepalive keeps serving us and the guardian keeps
-        # waiting; both see the fresh session.
+        # waiting; both see the fresh session. Un-ignore USR1 first: a signal
+        # ignored across exec stays ignored, and bash can't trap it again —
+        # the watchdog would be dead after the first restart.
+        trap - USR1
         exec "$SELF" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
     fi
     [ -n "$SUDO_KEEPALIVE_PID" ] && kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+    rm -f "$LOCK_FILE"
 }
 trap cleanup EXIT
 
@@ -349,13 +439,26 @@ dump_diagnostics_macos() {
 
 say "Radmin VPN for macOS"
 
+# One launcher at a time: a second one would kill the first one's service and
+# bridge (step 1) and tear down its interfaces. A watchdog restart re-execs
+# with our own PID, which the check lets through.
+LOCK_FILE="$STATE_DIR/launcher.pid"
+mkdir -p "$STATE_DIR"
+_other=$(cat "$LOCK_FILE" 2>/dev/null || true)
+if [ -n "$_other" ] && [ "$_other" != "$$" ] && kill -0 "$_other" 2>/dev/null \
+   && ps -o command= -p "$_other" 2>/dev/null | grep -q run_macos; then
+    die "Radmin VPN is already running (launcher pid $_other). Stop it first (Ctrl+C in its window)."
+fi
+echo $$ > "$LOCK_FILE"
+OWN_LOCK=1
+
 # ── Prerequisites ─────────────────────────────────────────────────────────────
 [ "$(uname -s)" = "Darwin" ] || die "this launcher is for macOS; use ./run.sh on Linux"
 if [ "$(uname -m)" = "arm64" ] && ! arch -x86_64 /usr/bin/true 2>/dev/null; then
     die "Rosetta 2 is not installed (Wine runs x86_64 code). Install it with:
     softwareupdate --install-rosetta --agree-to-license"
 fi
-for f in tap_bridge rvpnnetmp.sys adapter_hook.dll rvpn_launcher.exe netsh.exe netsh64.exe drvinst.exe; do
+for f in tap_bridge rvpnnetmp.sys adapter_hook.dll rvpn_launcher.exe netsh.exe netsh64.exe drvinst.exe wow64cpu.dll; do
     [ -f "$BUILD_DIR/$f" ] || die "missing $BUILD_DIR/$f — run 'make -f Makefile.macos' first"
 done
 command -v python3 >/dev/null || die "python3 not found (xcode-select --install)"
@@ -399,7 +502,7 @@ fi
 # ── 1. Quiet the prefix ───────────────────────────────────────────────────────
 pkill -f "RvControlSvc|RvRvpnGui|rvpn_launcher" 2>/dev/null || true
 sleep 0.3
-wineserver -k 2>/dev/null || true
+wine_stop
 scrub_ndis_driver
 
 # ── 2. Install / update Radmin ────────────────────────────────────────────────
@@ -422,19 +525,95 @@ install_radmin() {
     fi
     mkdir -p "$WINEPREFIX"
     wineboot --init >/dev/null 2>&1 || true
-    wineserver -k 2>/dev/null || true
-    say "Running installer..."
-    wine "$INSTALLER" /VERYSILENT /NORESTART >/dev/null 2>&1 || true
-    say "Waiting for installer to finish..."
-    for _ in $(seq 1 60); do
-        sleep 0.5
-        [ -f "$RADMIN/RvControlSvc.exe" ] && break
-    done
+    if [ "$USE_CROSSOVER" -eq 1 ]; then
+        wine_stop
+        say "Running installer..."
+        wine "$INSTALLER" /VERYSILENT /NORESTART >/dev/null 2>&1 || true
+        say "Waiting for installer to finish..."
+        for _ in $(seq 1 60); do
+            sleep 0.5
+            [ -f "$RADMIN/RvControlSvc.exe" ] && break
+        done
+    else
+        install_from_msi
+    fi
     [ -f "$RADMIN/RvControlSvc.exe" ] || die "installation failed"
-    wineserver -k 2>/dev/null || true
+    wine_stop
     scrub_ndis_driver
+    import_crossover_identity
     wine reg add "HKLM\\SYSTEM\\CurrentControlSet\\Services\\RvControlSvc" /v Start /t REG_DWORD /d 4 /f > /dev/null 2>&1 || true
-    wineserver -k 2>/dev/null || true
+    wine_stop
+}
+
+# Free Wine: skip the Inno Setup wrapper (it crashes, see INNOUNP_URL) and
+# install the MSI it carries with Wine's own msiexec.
+install_from_msi() {
+    local tools="$DATA_DIR/tools" msi_dir="$DATA_DIR/msi-$RADMIN_VERSION" msi want
+    msi="$msi_dir/{tmp}/RadminVPN_$RADMIN_VERSION.msi"
+    if [ ! -f "$tools/innounp.exe" ]; then
+        mkdir -p "$tools"
+        say "Downloading innounp (Inno Setup unpacker)..."
+        _fetch_verified "$INNOUNP_URL" "$tools/innounp-2.zip" "$INNOUNP_SHA256" \
+            || die "innounp download failed"
+        unzip -o -q -j "$tools/innounp-2.zip" innounp.exe -d "$tools" || die "could not unpack innounp"
+        rm -f "$tools/innounp-2.zip"
+    fi
+    if [ ! -f "$msi" ]; then
+        say "Extracting the Radmin MSI from the installer..."
+        mkdir -p "$msi_dir"
+        _timeout 300 wine "$tools/innounp.exe" -x -y -d"Z:$msi_dir" "$INSTALLER" \
+            "{tmp}\\RadminVPN_$RADMIN_VERSION.msi" >/dev/null 2>&1 || true
+        [ -f "$msi" ] || die "could not extract the MSI from $INSTALLER"
+    fi
+    want=""
+    [ "$RADMIN_VERSION" = "$RADMIN_DEFAULT_VERSION" ] && want="$RADMIN_MSI_SHA256_PINNED"
+    if [ -n "$want" ] && [ "$(_sha256_of "$msi")" != "$want" ]; then
+        rm -f "$msi"
+        die "the extracted MSI does not match the pinned sha256 — refusing to install it"
+    fi
+    cp -f "$msi" "$WINEPREFIX/drive_c/radmin_setup.msi"
+    # msiexec under a fresh prefix can stop half-way on its first run (RPC
+    # service start-up); a second pass completes it, so allow one retry.
+    for attempt in 1 2; do
+        say "Installing Radmin VPN from the MSI (attempt $attempt)..."
+        _timeout 600 wine msiexec /i 'C:\radmin_setup.msi' /qn '/l*v' 'C:\radmin_msi.log' \
+            >/dev/null 2>&1 || true
+        [ -f "$RADMIN/RvControlSvc.exe" ] && [ -f "$RADMIN/RvRvpnGui.exe" ] && break
+    done
+    rm -f "$WINEPREFIX/drive_c/radmin_setup.msi"
+}
+
+# Moving from a CrossOver install: carry the Radmin identity (RID, its server
+# password, name, joined networks, GUI state) over from the bottle, so friends
+# keep seeing the same peer. Registry sections are copied as-is between the two
+# Wine prefixes, offline (the wineserver must be down so it doesn't overwrite).
+import_crossover_identity() {
+    [ "$USE_CROSSOVER" -eq 0 ] || return 0
+    [ -f "$CX_BOTTLE_DIR/system.reg" ] || return 0
+    grep -aq '^"RID"=' "$CX_BOTTLE_DIR/system.reg" || return 0
+    if [ "$FORCE_IMPORT_ID" -eq 0 ] && grep -aq '^"RID"=' "$WINEPREFIX/system.reg" 2>/dev/null; then
+        return 0   # already has an identity of its own
+    fi
+    # -w: -k only asks the server to quit, and it saves the registry on its
+    # way out — on top of whatever we write here if we don't wait.
+    wine_stop
+    local f
+    # The adapter MAC lives next to the registry; keep it with the identity.
+    [ -f "$CX_BOTTLE_DIR/radmin_mac" ] && cp -f "$CX_BOTTLE_DIR/radmin_mac" "$WINEPREFIX/radmin_mac"
+    # Section headers look like [Software\\Wow6432Node\\Famatech\\RadminVPN] (the
+    # file doubles each backslash). Passed through the environment: awk -v
+    # would rewrite the backslashes.
+    export RVPN_SECT_RE='^\[Software\\\\(Wow6432Node\\\\)?Famatech\\\\'
+    for f in system.reg user.reg; do
+        [ -f "$CX_BOTTLE_DIR/$f" ] && [ -f "$WINEPREFIX/$f" ] || continue
+        # Drop the target's own (fresh, identity-less) Famatech sections, then
+        # append the bottle's.
+        awk '/^\[/ { skip = ($0 ~ ENVIRON["RVPN_SECT_RE"]) } !skip' "$WINEPREFIX/$f" > "$WINEPREFIX/$f.rvpn"
+        { echo; awk '/^\[/ { keep = ($0 ~ ENVIRON["RVPN_SECT_RE"]) } keep' "$CX_BOTTLE_DIR/$f"; } \
+            >> "$WINEPREFIX/$f.rvpn"
+        mv "$WINEPREFIX/$f.rvpn" "$WINEPREFIX/$f"
+    done
+    good "Imported your Radmin ID and networks from the CrossOver bottle $CX_BOTTLE_NAME"
 }
 
 INSTALLED_VERSION="$(radmin_installed_version)"
@@ -452,6 +631,11 @@ elif [ "$DO_UPDATE" -eq 1 ]; then
     fi
 elif [ -n "$INSTALLED_VERSION" ] && version_gt "$RADMIN_VERSION" "$INSTALLED_VERSION"; then
     warn "Radmin VPN $INSTALLED_VERSION installed, $RADMIN_VERSION validated — run './run_macos.sh --update'"
+fi
+# Once per launch: a watchdog restart must not redo it.
+if [ "$FORCE_IMPORT_ID" -eq 1 ] && [ "$RVPN_RESTARTS" -eq 0 ]; then
+    [ -f "$CX_BOTTLE_DIR/system.reg" ] || die "--import-crossover-id: no CrossOver bottle at $CX_BOTTLE_DIR"
+    import_crossover_identity
 fi
 
 install_components
@@ -542,7 +726,7 @@ wine reg add "HKCU\\Control Panel\\Desktop" /v LogPixels /t REG_DWORD /d "$_dpi"
 wine reg add "HKLM\\System\\CurrentControlSet\\Hardware Profiles\\Current\\Software\\Fonts" /v LogPixels /t REG_DWORD /d "$_dpi" /f
 } > /dev/null 2>&1
 
-wineserver -k 2>/dev/null || true
+wine_stop
 boot_wineserver
 good "Registry configured"
 

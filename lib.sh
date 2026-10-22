@@ -239,7 +239,10 @@ scrub_ndis_driver() {
     [ -f "$reg" ] || return 0
     grep -qa 'Services\\\\RvNetMP60' "$reg" || return 0
 
+    # -w: -k only asks the server to quit, and it rewrites system.reg on its
+    # way out — over our edit, if we don't wait for it.
     wineserver -k 2>/dev/null || true
+    wineserver -w 2>/dev/null || true
     if awk '/^\[/ { drop = ($0 ~ /Services\\\\RvNetMP60(\\\\|\])/) } !drop' "$reg" > "$reg.rvpn"; then
         mv "$reg.rvpn" "$reg"
         good "Removed poisoned RvNetMP60 driver service from the prefix (issue #12)"

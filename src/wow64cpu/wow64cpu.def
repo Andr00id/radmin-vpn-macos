@@ -1,0 +1,11 @@
+LIBRARY wow64cpu.dll
+EXPORTS
+BTCpuGetBopCode
+BTCpuGetContext
+BTCpuIsProcessorFeaturePresent
+BTCpuProcessInit
+BTCpuResetToConsistentState
+BTCpuSetContext
+BTCpuSimulate
+BTCpuTurboThunkControl
+__wine_get_unix_opcode

@@ -1,0 +1,16 @@
+LIBRARY ntdll.dll
+EXPORTS
+LdrDisableThreadCalloutsForDll
+LdrGetDllHandle
+NtProtectVirtualMemory
+NtQuerySystemInformation
+RtlCaptureContext
+RtlFindExportedRoutineByName
+RtlIsProcessorFeaturePresent
+RtlWow64GetThreadContext
+RtlWow64SetThreadContext
+_vsnprintf
+memcpy
+memset
+__wine_dbg_header
+__wine_dbg_output

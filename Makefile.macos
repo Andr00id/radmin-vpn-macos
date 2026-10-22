@@ -1,7 +1,10 @@
 # Makefile.macos - build for macOS: make -f Makefile.macos
 #
-# Native: tap_bridge (clang). Wine side: the same PE files as on Linux, cross-
-# compiled with Homebrew's mingw-w64 (brew install mingw-w64).
+# Native: tap_bridge (clang, universal arm64 + x86_64). Wine side: the same PE
+# files as on Linux, cross-compiled with Homebrew's mingw-w64
+# (brew install mingw-w64), plus wow64cpu.dll — Wine 11.18's WoW64 CPU layer
+# with a Rosetta fix (src/wow64cpu/cpu.c), which lets free Wine run Radmin's
+# 32-bit GUI on Apple Silicon.
 #
 # Not built here: the LD_PRELOAD shims (rvpn_reuseport is unnecessary on macOS,
 # wineserver already sets SO_REUSEPORT there; rvpn_dnsfix targets glibc) and the
@@ -9,10 +12,12 @@
 
 CC       = clang
 CFLAGS   = -Wall -O2
+ARCHS    = -arch arm64 -arch x86_64
 BUILD    = build
 
 MINGW32  = i686-w64-mingw32-gcc
 MINGW64  = x86_64-w64-mingw32-gcc
+DLLTOOL64 = x86_64-w64-mingw32-dlltool
 STRIP32  = i686-w64-mingw32-strip
 STRIP64  = x86_64-w64-mingw32-strip
 
@@ -21,9 +26,18 @@ DDK_INC  := $(firstword $(wildcard \
     $(MINGW_PREFIX)/toolchain-x86_64/x86_64-w64-mingw32/include/ddk \
     $(MINGW_PREFIX)/toolchain-x86_64/include/ddk))
 
+# Wine's headers for wow64cpu.dll, fetched once from the matching tag.
+WINE_TAG     = wine-11.18
+WINE_REPO    = https://gitlab.winehq.org/wine/wine.git
+WINE_INC     = $(BUILD)/wine-include/include
+GCC64_INC   := $(shell $(MINGW64) -print-file-name=include 2>/dev/null)
+WOW64CPU_CFLAGS = -O2 -Wall -fno-builtin -fno-strict-aliasing \
+    -D__WINESRC__ -D__WINE_PE_BUILD -D_MSVCR_VER=0 -D_WIN32_WINNT=0x0a00 \
+    -nostdinc -isystem $(GCC64_INC) -I$(WINE_INC)/msvcrt -I$(WINE_INC)
+
 BINS = $(BUILD)/tap_bridge $(BUILD)/rvpnnetmp.sys $(BUILD)/adapter_hook.dll \
        $(BUILD)/rvpn_launcher.exe $(BUILD)/netsh.exe $(BUILD)/netsh64.exe \
-       $(BUILD)/drvinst.exe
+       $(BUILD)/drvinst.exe $(BUILD)/wow64cpu.dll
 
 all: check-deps $(BINS)
 	$(STRIP64) -s $(BUILD)/rvpnnetmp.sys $(BUILD)/netsh64.exe
@@ -33,7 +47,7 @@ all: check-deps $(BINS)
 bridge: $(BUILD)/tap_bridge
 
 $(BUILD)/tap_bridge: src/tap_bridge.c | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ $< -lpthread
+	$(CC) $(CFLAGS) $(ARCHS) -o $@ $< -lpthread
 
 $(BUILD)/rvpnnetmp.sys: src/rvpnnetmp.c | $(BUILD)
 	$(MINGW64) -shared -o $@ $< -I$(DDK_INC) \
@@ -55,6 +69,29 @@ $(BUILD)/netsh64.exe: src/netsh_wrapper.c | $(BUILD)
 $(BUILD)/drvinst.exe: src/drvinst.c | $(BUILD)
 	$(MINGW32) $(CFLAGS) -o $@ $<
 
+$(WINE_INC)/winternl.h: | $(BUILD)
+	rm -rf $(BUILD)/wine-include
+	git -c advice.detachedHead=false clone -q --depth 1 --branch $(WINE_TAG) --filter=blob:none --sparse \
+		$(WINE_REPO) $(BUILD)/wine-include
+	git -C $(BUILD)/wine-include sparse-checkout set include
+
+# Import libraries built from our .def files: only what wow64cpu needs.
+$(BUILD)/libntdll.a: src/wow64cpu/ntdll.def | $(BUILD)
+	$(DLLTOOL64) -d $< -l $@
+$(BUILD)/libwow64.a: src/wow64cpu/wow64.def | $(BUILD)
+	$(DLLTOOL64) -d $< -l $@
+
+# Linked like Wine's own builtin (same image base, no CRT, DllMain entry),
+# then stamped "Wine builtin DLL" at 0x40 as winebuild --builtin does, so it
+# can replace the builtin inside a Wine install.
+$(BUILD)/wow64cpu.dll: src/wow64cpu/cpu.c src/wow64cpu/wow64cpu.def \
+                       $(WINE_INC)/winternl.h $(BUILD)/libntdll.a $(BUILD)/libwow64.a
+	$(MINGW64) -c $(WOW64CPU_CFLAGS) -o $(BUILD)/wow64cpu.o src/wow64cpu/cpu.c
+	$(MINGW64) -shared -nostdlib -o $@ $(BUILD)/wow64cpu.o src/wow64cpu/wow64cpu.def \
+		-L$(BUILD) -lwow64 -lntdll \
+		-Wl,--image-base,0x7a400000 -Wl,--entry,DllMain -Wl,--enable-stdcall-fixup
+	printf 'Wine builtin DLL\0' | dd of=$@ bs=1 seek=64 conv=notrunc 2>/dev/null
+
 $(BUILD):
 	mkdir -p $(BUILD)
 
@@ -62,6 +99,7 @@ check-deps:
 	@command -v $(MINGW32) >/dev/null || { echo "Missing mingw-w64: brew install mingw-w64"; exit 1; }
 	@command -v $(MINGW64) >/dev/null || { echo "Missing mingw-w64: brew install mingw-w64"; exit 1; }
 	@[ -n "$(DDK_INC)" ] || { echo "mingw-w64 DDK headers not found under $(MINGW_PREFIX)"; exit 1; }
+	@command -v git >/dev/null || { echo "Missing git (xcode-select --install)"; exit 1; }
 
 clean:
 	rm -rf $(BUILD)

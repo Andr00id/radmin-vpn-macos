@@ -1,8 +1,12 @@
-name: Build
+name: Linux build check
 
+# The Linux side of the shared sources (src/tap_bridge.c, the PE components)
+# must keep building; releases of this repository are the macOS ones
+# (see macos.yml).
 on:
   push:
-    tags: ['v*']
+    branches: [main]
+  pull_request:
   workflow_dispatch:
 
 jobs:
@@ -14,15 +18,10 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-mingw-w64 libgtk-4-dev imagemagick file
+          sudo apt-get install -y gcc-mingw-w64 libgtk-4-dev file upx-ucl
 
       - name: Build binaries
         run: make
-
-      - name: Build AppImage
-        run: ./packaging/build-appimage.sh
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload binaries
         uses: actions/upload-artifact@v4
@@ -39,38 +38,3 @@ jobs:
             build/rvpn_filter_ui
             build/rvpn_dnsfix.so
             build/rvpn_reuseport.so
-
-      - name: Upload AppImage
-        uses: actions/upload-artifact@v4
-        with:
-          name: radmin-vpn-linux-appimage
-          path: packaging/dist/RadminVPN-Linux-x86_64.AppImage
-
-  release:
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: radmin-vpn-linux-binaries
-          path: build/
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: radmin-vpn-linux-appimage
-          path: .
-
-      - name: Package tarball
-        run: tar czf radmin-vpn-linux-${{ github.ref_name }}.tar.gz -C build .
-
-      - name: Create release
-        uses: softprops/action-gh-release@v2
-        with:
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          files: |
-            radmin-vpn-linux-${{ github.ref_name }}.tar.gz
-            RadminVPN-Linux-x86_64.AppImage
-          generate_release_notes: true
