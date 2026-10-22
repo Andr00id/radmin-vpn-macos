@@ -1354,8 +1354,11 @@ static NTSTATUS NTAPI DispatchWrite(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         /* Mode >= 2: skip 4-byte mac prefix */
         if (mode >= 2) {
             if (offset + 4 > length) break;
-            /* Log first 3 WRITE mac_prefix values for comparison with READ */
-            if (frameCount < 3) {
+            /* Log first 3 WRITE mac_prefix values for comparison with READ.
+             * The counter is global: a per-call one logged nearly every
+             * outgoing packet (6 MB of "WR mac=" per hour of play). */
+            static LONG wr_mac_log = 0;
+            if (wr_mac_log < 3 && InterlockedIncrement(&wr_mac_log) <= 3) {
                 char buf[64] = "WR mac=";
                 static const char hx3[] = "0123456789abcdef";
                 int j;

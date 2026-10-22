@@ -18,6 +18,9 @@
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
+# For the watchdog's self-restart. Absolute: we cd into the Radmin folder later.
+SELF="$DIR/$(basename "$0")"
+ORIG_ARGS=("$@")
 
 source "$DIR/lib.sh"
 
@@ -81,8 +84,25 @@ wine_major() { wine_version_str | sed -nE 's/^wine-([0-9]+).*/\1/p'; }
 # sets SO_REUSEPORT itself under __APPLE__ (see src/rvpn_reuseport.c).
 boot_wineserver() { wineserver -p; }
 
-# `timeout` is GNU coreutils; perl's alarm does the same job everywhere.
-_timeout() { local s="$1"; shift; perl -e 'alarm shift; exec @ARGV' "$s" "$@"; }
+# `timeout` is GNU coreutils and perl's `exec` would bypass the wine() shell
+# function CrossOver needs, so run the command in the background and kill it
+# when the time is up — the whole tree, since a function runs in a subshell
+# whose children (CrossOver's wrapper, wineloader) would otherwise keep a
+# $(...) around us waiting on its pipe. The killer's output goes to /dev/null
+# for the same reason.
+_kill_tree() {
+    local c
+    for c in $(pgrep -P "$1" 2>/dev/null); do _kill_tree "$c"; done
+    kill "$1" 2>/dev/null || true
+}
+_timeout() {
+    local s="$1" p k rc=0; shift
+    "$@" & p=$!
+    ( sleep "$s"; _kill_tree "$p" ) >/dev/null 2>&1 & k=$!
+    wait "$p" || rc=$?
+    kill "$k" 2>/dev/null || true
+    return "$rc"
+}
 
 export WINEDEBUG=-all
 RADMIN="$WINEPREFIX/drive_c/Program Files (x86)/Radmin VPN"
@@ -95,6 +115,13 @@ MAC_FILE="$WINEPREFIX/radmin_mac"
 RELAY_PID=""
 BRIDGE_PID=""
 SUDO_KEEPALIVE_PID=""
+WATCHDOG_PID=""
+RESTART_REQUESTED=0
+RVPN_RESTARTS="${RVPN_RESTARTS:-0}"
+MAX_RESTARTS=3
+# User-owned (not /tmp): macos_guard.sh reads it as root after we exit.
+STATE_DIR="$HOME/Library/Caches/radmin-vpn-macos"
+ROUTES_STATE="$STATE_DIR/routes.state"
 NO_UI=0
 RETINA=1          # render the GUI at native Retina resolution (--no-retina: Wine's 1x, upscaled)
 SAVED_ROUTES=""   # "dest iface" lines to put back on exit
@@ -107,7 +134,9 @@ INSTALLER=""
 INSTALLER_EXPLICIT=""
 while [ $# -gt 0 ]; do
     case "$1" in
-        --installer) INSTALLER="${2:-}"; INSTALLER_EXPLICIT=1; shift ;;
+        --installer)
+            [ $# -ge 2 ] || die "--installer needs a path to Radmin_VPN_*.exe"
+            INSTALLER="$2"; INSTALLER_EXPLICIT=1; shift ;;
         --installer=*) INSTALLER="${1#*=}"; INSTALLER_EXPLICIT=1 ;;
         --no-ui) NO_UI=1 ;;
         --no-retina) RETINA=0 ;;
@@ -150,36 +179,63 @@ fi
 # macOS keeps one unscoped route per destination, so "append" as on Linux is not
 # possible: we move the route to the feth and remember where it was. A route
 # that did not exist before is recorded with iface "-" and deleted on exit.
-_route_exact_iface() {   # interface of the route for exactly $1, or nothing
-    route -n get "$1" 2>/dev/null | awk -v d="$1" '
+# SAVED_ROUTES is mirrored to $ROUTES_STATE for macos_guard.sh, which restores
+# it as root if we die without being able to (no tty, no sudo ticket).
+# Interface of the route for exactly <kind> <dest>, or nothing. `route get` on
+# a network's own address can answer "default" (it does for the cloning
+# 224.0.0.0/4), so for a network ask about its first host and check that the
+# match is that network.
+_route_exact_iface() {   # _route_exact_iface <-host|-net> <dest[/len]>
+    local kind="$1" net="${2%/*}" probe="${2%/*}"
+    [ "$kind" = "-net" ] && probe="${net%.*}.$(( ${net##*.} + 1 ))"
+    route -n get "$probe" 2>/dev/null | awk -v d="$net" '
         /destination:/ { dst = $2 } /interface:/ { ifc = $2 }
         END { if (dst == d) print ifc }'
 }
 
+_save_routes_state() {
+    mkdir -p "$STATE_DIR"
+    printf '%s' "$SAVED_ROUTES" > "$ROUTES_STATE"
+}
+
 steal_route() {   # steal_route <-host|-net> <dest>
     local kind="$1" dest="$2" orig
-    orig=$(_route_exact_iface "${dest%/*}")
+    orig=$(_route_exact_iface "$kind" "$dest")
     [ "$orig" = "$TAP_DEV" ] && return 0
     if [ -n "$orig" ]; then
-        sudo route -n change "$kind" "$dest" -interface "$TAP_DEV" >/dev/null 2>&1 || return 1
-        SAVED_ROUTES+="$kind $dest $orig"$'\n'
+        # Record first, so a crash between here and the change is undone too.
+        SAVED_ROUTES+="$kind $dest $orig"$'\n'; _save_routes_state
+        sudo route -n change "$kind" "$dest" -interface "$TAP_DEV" >/dev/null 2>&1 || true
+        # `route change` can report success yet leave a cloning route such as
+        # 224.0.0.0/4 on its interface: check, and replace it if it stuck.
+        if [ "$(_route_exact_iface "$kind" "$dest")" != "$TAP_DEV" ]; then
+            sudo route -n delete "$kind" "$dest" >/dev/null 2>&1 || true
+            sudo route -n add "$kind" "$dest" -interface "$TAP_DEV" >/dev/null 2>&1 || true
+        fi
     else
-        sudo route -n add "$kind" "$dest" -interface "$TAP_DEV" >/dev/null 2>&1 || return 1
-        SAVED_ROUTES+="$kind $dest -"$'\n'
+        SAVED_ROUTES+="$kind $dest -"$'\n'; _save_routes_state
+        sudo route -n add "$kind" "$dest" -interface "$TAP_DEV" >/dev/null 2>&1 || true
     fi
+    [ "$(_route_exact_iface "$kind" "$dest")" = "$TAP_DEV" ]
 }
 
 restore_routes() {   # must run before the feth is destroyed
-    local kind dest iface
-    while read -r kind dest iface; do
-        [ -n "$dest" ] || continue
-        if [ "$iface" = "-" ]; then
-            sudo route -n delete "$kind" "$dest" >/dev/null 2>&1 || true
-        else
-            sudo route -n change "$kind" "$dest" -interface "$iface" >/dev/null 2>&1 || true
-        fi
-    done <<< "$SAVED_ROUTES"
+    local kind dest iface ok=1
+    sudo -n true 2>/dev/null || ok=0
+    if [ "$ok" -eq 1 ]; then
+        while read -r kind dest iface; do
+            [ -n "$dest" ] || continue
+            # delete + add rather than change: change can silently not apply.
+            sudo -n route -n delete "$kind" "$dest" >/dev/null 2>&1 || true
+            if [ "$iface" != "-" ]; then
+                sudo -n route -n add "$kind" "$dest" -interface "$iface" >/dev/null 2>&1 || ok=0
+            fi
+        done <<< "$SAVED_ROUTES"
+    fi
     SAVED_ROUTES=""
+    # Without sudo, leave the state file: macos_guard.sh restores from it.
+    [ "$ok" -eq 1 ] && rm -f "$ROUTES_STATE"
+    return 0
 }
 
 # ── netsh relay ───────────────────────────────────────────────────────────────
@@ -216,28 +272,60 @@ relay_one() {
 }
 
 # ── Teardown ──────────────────────────────────────────────────────────────────
-destroy_feth() {
-    sudo ifconfig "$TAP_DEV" destroy 2>/dev/null || true
-    sudo ifconfig "$TAP_PEER" destroy 2>/dev/null || true
+destroy_feth() {   # -n: never hang on a password prompt with no tty
+    sudo -n ifconfig "$TAP_DEV" destroy 2>/dev/null || true
+    sudo -n ifconfig "$TAP_PEER" destroy 2>/dev/null || true
 }
 
 HAVE_SUDO=0   # cleanup only touches root state once sudo was primed
 
 cleanup() {
+    # A dying service during teardown must not look like a crash to restart.
+    trap '' USR1
+    [ -n "$WATCHDOG_PID" ] && kill "$WATCHDOG_PID" 2>/dev/null || true
     echo
     say "Closing Radmin VPN..."
     wineserver -k 2>/dev/null || true
     [ -n "$RELAY_PID" ] && kill "$RELAY_PID" 2>/dev/null || true
     if [ "$HAVE_SUDO" -eq 1 ]; then
-        sudo pkill -x tap_bridge 2>/dev/null || true
+        # Bridge first, so it isn't left reading a destroyed interface.
+        sudo -n pkill -x tap_bridge 2>/dev/null || true
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            pgrep -x tap_bridge >/dev/null || break
+            sleep 0.2
+        done
         restore_routes
         destroy_feth
     fi
     rm -f "$CMD_FILE" "${CMD_FILE}.proc" /tmp/rvpn_b2d /tmp/rvpn_d2b \
           /tmp/rvpn_d2b_high /tmp/rvpn_d2b_low /tmp/rvpn_mac
+    if [ "$RESTART_REQUESTED" -eq 1 ]; then
+        export RVPN_RESTARTS=$((RVPN_RESTARTS + 1))
+        say "Restarting Radmin VPN (attempt $RVPN_RESTARTS of $MAX_RESTARTS)..."
+        # Same PID, so the keepalive keeps serving us and the guardian keeps
+        # waiting; both see the fresh session.
+        exec "$SELF" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
+    fi
     [ -n "$SUDO_KEEPALIVE_PID" ] && kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
 }
 trap cleanup EXIT
+
+# The watchdog signals USR1 when the bridge or the service is gone: tear
+# everything down and start over (cleanup re-execs us), a few times at most.
+on_crash() {
+    # Only crashes in quick succession count towards the limit.
+    if [ -n "${SESSION_START:-}" ] && [ $(( $(date +%s) - SESSION_START )) -gt 600 ]; then
+        RVPN_RESTARTS=0
+    fi
+    if [ "$RVPN_RESTARTS" -ge "$MAX_RESTARTS" ]; then
+        warn "VPN failed $RVPN_RESTARTS times in a row — giving up. Logs: /tmp/radmin_bridge.log, /tmp/radmin_service.log"
+        exit 1
+    fi
+    warn "$(cat "$STATE_DIR/crash_reason" 2>/dev/null || echo 'VPN component died') — restarting the VPN"
+    RESTART_REQUESTED=1
+    exit 1
+}
+trap on_crash USR1
 
 dump_diagnostics_macos() {
     echo ""
@@ -282,8 +370,26 @@ fi
 sudo -v || die "sudo is required for the feth interfaces, BPF and routes"
 HAVE_SUDO=1
 # The relay and cleanup need sudo long after the 5-minute ticket would expire.
-( while true; do sudo -n -v 2>/dev/null; sleep 60; done ) &
+# `kill -0 $$`: stop with us even if we die without running cleanup.
+( while kill -0 $$ 2>/dev/null; do sudo -n -v 2>/dev/null; sleep 60; done ) &
 SUDO_KEEPALIVE_PID=$!; disown
+
+# Root-side teardown that survives us (see macos_guard.sh). One per launch: a
+# watchdog restart re-execs with the same PID, which the guardian keeps
+# waiting on.
+if [ -z "${RVPN_GUARD_STARTED:-}" ]; then
+    mkdir -p "$STATE_DIR"
+    sudo -b /bin/bash "$DIR/macos_guard.sh" $$ "$ROUTES_STATE" "$TAP_DEV" "$TAP_PEER" \
+        </dev/null >/dev/null 2>&1 || warn "could not start macos_guard.sh — cleanup needs this terminal open"
+    export RVPN_GUARD_STARTED=1
+fi
+# A previous run that died before cleanup (and before its guardian could act)
+# leaves stolen routes behind: put them back now.
+if [ -s "$ROUTES_STATE" ] && [ "$RVPN_RESTARTS" -eq 0 ]; then
+    SAVED_ROUTES=$(cat "$ROUTES_STATE")$'\n'
+    say "Restoring routes left by an earlier run..."
+    restore_routes
+fi
 
 # ── 1. Quiet the prefix ───────────────────────────────────────────────────────
 pkill -f "RvControlSvc|RvRvpnGui|rvpn_launcher" 2>/dev/null || true
@@ -438,7 +544,7 @@ good "Registry configured"
 # ── 7. netsh relay ────────────────────────────────────────────────────────────
 rm -f "$CMD_FILE" "${CMD_FILE}.proc" /tmp/radmin_relay.log
 (
-    while true; do
+    while kill -0 $$ 2>/dev/null; do   # never outlive the launcher
         if [ -f "$CMD_FILE" ]; then
             mv "$CMD_FILE" "${CMD_FILE}.proc" 2>/dev/null || continue
             while IFS= read -r line; do
@@ -518,10 +624,31 @@ steal_route -host 224.0.2.60 || true
 if [ "$NO_BCAST_ROUTES" = "0" ]; then
     # LAN-game discovery. Moves these off your Wi-Fi until exit; Bonjour and
     # AirDrop pick their interface explicitly and are not affected.
-    steal_route -host 255.255.255.255 && steal_route -net 224.0.0.0/4 \
-        && good "Routes: broadcast + multicast → $TAP_DEV (--no-broadcast-routes to skip)" \
-        || warn "could not move broadcast/multicast routes to $TAP_DEV"
+    steal_route -host 255.255.255.255 && good "Route: broadcast → $TAP_DEV" \
+        || warn "could not move the broadcast route to $TAP_DEV"
+    steal_route -net 224.0.0.0/4 && good "Route: multicast → $TAP_DEV (--no-broadcast-routes to skip both)" \
+        || warn "could not move the multicast route to $TAP_DEV"
 fi
+
+# ── Watchdog ──────────────────────────────────────────────────────────────────
+# If the bridge or the service dies, Radmin can keep showing peers online while
+# nothing passes. Notice it and have on_crash restart the whole VPN.
+SESSION_START=$(date +%s)
+rm -f "$STATE_DIR/crash_reason"
+(
+    while kill -0 $$ 2>/dev/null; do
+        sleep 3
+        reason=""
+        pgrep -x tap_bridge >/dev/null || reason="tap_bridge stopped (see /tmp/radmin_bridge.log)"
+        pgrep -f 'RvControlSvc.exe' >/dev/null || reason="Radmin service stopped (see /tmp/radmin_service.log)"
+        if [ -n "$reason" ]; then
+            echo "$reason" > "$STATE_DIR/crash_reason"
+            kill -USR1 $$ 2>/dev/null
+            break
+        fi
+    done
+) &
+WATCHDOG_PID=$!; disown
 
 # ── 10. GUI ───────────────────────────────────────────────────────────────────
 GUI_PID=""
@@ -559,5 +686,7 @@ while [ -n "$GUI_PID" ]; do
     fi
 done
 if [ -z "$GUI_PID" ]; then
-    wait "$BRIDGE_PID" || true
+    # Headless: idle until Ctrl+C or the watchdog. `wait` on a short-lived
+    # sleep keeps us interruptible by its USR1.
+    while true; do sleep 60 & wait $! || true; done
 fi

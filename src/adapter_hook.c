@@ -31,7 +31,8 @@
 
 /* Host interface name of our TAP. Linux names it radminvpn0; macOS cannot name
  * interfaces freely, so run_macos.sh exports RVPN_TAP_NAME=feth26 (Wine passes
- * the Unix environment through) and the same PE build serves both hosts. */
+ * the Unix environment through) and the same PE build serves both hosts.
+ * First called from DllMain (single-threaded), so the lazy init never races. */
 static const WCHAR *tap_desc(void)
 {
     static WCHAR name[64];
@@ -1170,6 +1171,15 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
     (void)inst; (void)reserved;
     if (reason == DLL_PROCESS_ATTACH) {
         dbg("adapter_hook.dll loaded");
+
+        /* Resolve the TAP name now, under the loader lock and before any hook
+         * exists: tap_desc()'s lazy init is not thread-safe, and the service
+         * enumerates adapters from several threads. */
+        {
+            char nb[96];
+            snprintf(nb, sizeof(nb), "TAP interface name: %ls", tap_desc());
+            dbg(nb);
+        }
 
         /* Install crash capture first so a fault anywhere in the service
          * (incl. the packet path) gets dumped to C:\radmin_crash.log. */

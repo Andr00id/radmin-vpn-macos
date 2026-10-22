@@ -49,6 +49,8 @@
 #ifdef __APPLE__
 #include <net/bpf.h>
 #include <net/ndrv.h>
+#include <net/if_dl.h>
+#include <ifaddrs.h>
 #else
 #include <linux/if_tun.h>
 #endif
@@ -92,6 +94,15 @@ static unsigned long     g_arp_replies_sent = 0;
 static unsigned long     g_arp_snooped = 0;
 static uint8_t           g_local_ip[4] = {0};
 static int               g_have_local_ip = 0;
+/* The TAP's own MAC. The host's frames carry it as sender, and its address is
+ * usually assigned only after we start (so detect_local_ip finds nothing):
+ * matching on the MAC keeps the host's own IP out of the cache regardless. */
+static uint8_t           g_tap_mac[6] = {0};
+static int               g_have_tap_mac = 0;
+
+/* Owner allowed for files we read from /tmp: the sudo user when run through
+ * sudo (always on macOS, where the bridge is root), else ourselves. */
+static uid_t             g_owner_uid = (uid_t)-1;
 
 static pthread_mutex_t g_arp_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -101,7 +112,7 @@ static pthread_mutex_t g_arp_lock = PTHREAD_MUTEX_INITIALIZER;
 #else
 #define TAP_DEV_NAME    "radminvpn0"
 #endif
-#define FIFO_B2D       "/tmp/rvpn_b2d"
+#define FIFO_B2D        "/tmp/rvpn_b2d"
 #define FIFO_D2B_HIGH   "/tmp/rvpn_d2b_high"
 #define FIFO_D2B_LOW    "/tmp/rvpn_d2b_low"
 #define MTU             1500
@@ -251,12 +262,14 @@ static int replicate_mcast_to_bcast(int write_fd, const uint8_t *frame, uint16_t
  * must follow: giving up would leave the reader mid-record and desync the
  * stream for good. Linux hides this (pipe I/O up to PIPE_BUF = 4096 bytes is
  * all-or-nothing), but macOS's PIPE_BUF is 512, so a 1514-byte frame is
- * routinely split. Wait for the FIFO instead, up to FIFO_STALL_MS in total. */
+ * routinely split. Wait for the FIFO instead, for as long as the bridge runs:
+ * under Rosetta the Wine side can stall for seconds, and giving up would kill
+ * the bridge for a hiccup. A stall is logged every FIFO_STALL_MS. */
 #define FIFO_STALL_MS 5000
 
-static int wait_fifo(int fd, int for_write, int *budget_ms)
+static int wait_fifo(int fd, int for_write, int *waited_ms)
 {
-    while (*budget_ms > 0) {
+    while (__atomic_load_n(&running, __ATOMIC_RELAXED)) {
         fd_set fds;
         FD_ZERO(&fds);
         FD_SET(fd, &fds);
@@ -264,9 +277,12 @@ static int wait_fifo(int fd, int for_write, int *budget_ms)
         int r = select(fd + 1, for_write ? NULL : &fds, for_write ? &fds : NULL, NULL, &tv);
         if (r > 0) return 0;
         if (r < 0 && errno != EINTR) return -1;
-        *budget_ms -= 100;
+        *waited_ms += 100;
+        if (*waited_ms % FIFO_STALL_MS == 0)
+            fprintf(stderr, "tap_bridge: FIFO %s stalled mid-frame for %d s\n",
+                    for_write ? "write" : "read", *waited_ms / 1000);
     }
-    errno = EIO;
+    errno = EINTR;
     return -1;
 }
 
@@ -276,14 +292,14 @@ static int wait_fifo(int fd, int for_write, int *budget_ms)
 static int write_exact(int fd, const void *buf, size_t n)
 {
     size_t done = 0;
-    int budget = FIFO_STALL_MS;
+    int waited = 0;
     while (done < n) {
         ssize_t w = write(fd, (const char *)buf + done, n - done);
         if (w < 0) {
             if (errno == EINTR)
                 continue;
             if ((errno == EAGAIN || errno == EWOULDBLOCK) && done > 0) {
-                if (wait_fifo(fd, 1, &budget) < 0) return -1;
+                if (wait_fifo(fd, 1, &waited) < 0) return -1;
                 continue;
             }
             return -1;
@@ -500,27 +516,45 @@ static void give_fifo_to_sudo_user(const char *path)
 {
     const char *uid = getenv("SUDO_UID"), *gid = getenv("SUDO_GID");
     if (geteuid() != 0 || !uid || !gid) return;
-    if (chown(path, (uid_t)atoi(uid), (gid_t)atoi(gid)) < 0)
+    /* lchown: never follow a link someone else planted at this path. */
+    if (lchown(path, (uid_t)atoi(uid), (gid_t)atoi(gid)) < 0)
         fprintf(stderr, "tap_bridge: chown %s: %s\n", path, strerror(errno));
+}
+
+/* /tmp is world-writable and on macOS we are root: a symlink planted at one of
+ * our fixed paths must never make us chown or write through it. mkfifo itself
+ * refuses to follow links (EEXIST), so insist that it succeeded and that what
+ * now sits at the path is our FIFO; the sticky bit then keeps anyone else from
+ * swapping it out. Returns 0 on success. */
+static int make_private_fifo(const char *path)
+{
+    struct stat st;
+    unlink(path);
+    if (mkfifo(path, 0600) < 0) {
+        fprintf(stderr, "tap_bridge: mkfifo %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    if (lstat(path, &st) < 0 || !S_ISFIFO(st.st_mode) || st.st_uid != geteuid()) {
+        fprintf(stderr, "tap_bridge: %s is not our FIFO, refusing it\n", path);
+        return -1;
+    }
+    give_fifo_to_sudo_user(path);
+    return 0;
 }
 
 /* Create named pipes for communication with Wine driver
  * FIFO_B2D:       bridge-to-driver (TAP → Wine): bridge writes, driver reads
  * FIFO_D2B_HIGH:  driver-to-bridge high priority (Wine → TAP)
  * FIFO_D2B_LOW:   driver-to-bridge low priority (Wine → TAP) */
-static void create_fifos(void)
+static int create_fifos(void)
 {
-    unlink(FIFO_B2D);
-    unlink(FIFO_D2B_HIGH);
-    unlink(FIFO_D2B_LOW);
-    mkfifo(FIFO_B2D, 0666);
-    mkfifo(FIFO_D2B_HIGH, 0666);
-    mkfifo(FIFO_D2B_LOW, 0666);
-    give_fifo_to_sudo_user(FIFO_B2D);
-    give_fifo_to_sudo_user(FIFO_D2B_HIGH);
-    give_fifo_to_sudo_user(FIFO_D2B_LOW);
+    if (make_private_fifo(FIFO_B2D) < 0 ||
+        make_private_fifo(FIFO_D2B_HIGH) < 0 ||
+        make_private_fifo(FIFO_D2B_LOW) < 0)
+        return -1;
     fprintf(stderr, "tap_bridge: FIFOs created: %s, %s, %s\n",
             FIFO_B2D, FIFO_D2B_HIGH, FIFO_D2B_LOW);
+    return 0;
 }
 
 /* Read exactly n bytes; returns 0 on success, -1 on error or EOF.
@@ -529,7 +563,7 @@ static void create_fifos(void)
 static int read_exact(int fd, void *buf, size_t n)
 {
     size_t done = 0;
-    int budget = FIFO_STALL_MS;
+    int waited = 0;
     while (done < n) {
         ssize_t r = read(fd, (char *)buf + done, n - done);
         if (r < 0) {
@@ -538,12 +572,15 @@ static int read_exact(int fd, void *buf, size_t n)
             /* The writer is mid-record (see wait_fifo): wait for the rest
              * rather than dropping the bytes already consumed. */
             if ((errno == EAGAIN || errno == EWOULDBLOCK) && done > 0) {
-                if (wait_fifo(fd, 0, &budget) < 0) return -1;
+                if (wait_fifo(fd, 0, &waited) < 0) return -1;
                 continue;
             }
             return -1;
         }
-        if (r == 0) return -1;
+        /* Writer closed (the Wine side died). Say so in errno: callers read
+         * EAGAIN as "drained", and a stale one here would spin forever on a
+         * FIFO that select() keeps reporting readable at EOF. */
+        if (r == 0) { errno = EPIPE; return -1; }
         done += r;
     }
     return 0;
@@ -599,11 +636,26 @@ static int json_str_array(const char *json, const char *key,
 static void load_filters_internal(void)
 {
     struct stat st;
-    if (stat(FILTER_PATH, &st) != 0) return;
+    if (lstat(FILTER_PATH, &st) != 0) return;
     if (st.st_mtime == filters_mtime) return;  /* unchanged */
 
-    FILE *f = fopen(FILTER_PATH, "r");
-    if (!f) return;
+    /* The bridge may run as root and /tmp is world-writable: read the filter
+     * file only if it is a regular file (not a link) owned by our user. */
+    int ffd = open(FILTER_PATH, O_RDONLY | O_NOFOLLOW);
+    if (ffd < 0) return;
+    struct stat fst;
+    if (fstat(ffd, &fst) < 0 || !S_ISREG(fst.st_mode) ||
+        (fst.st_uid != geteuid() && fst.st_uid != g_owner_uid)) {
+        if (fst.st_mtime != filters_mtime) {
+            fprintf(stderr, "tap_bridge: ignoring %s (not a regular file owned by us)\n",
+                    FILTER_PATH);
+            filters_mtime = fst.st_mtime;
+        }
+        close(ffd);
+        return;
+    }
+    FILE *f = fdopen(ffd, "r");
+    if (!f) { close(ffd); return; }
     if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return; }
     long sz = ftell(f);
     if (sz <= 0 || sz > 65536) { fclose(f); return; }
@@ -781,6 +833,42 @@ static void detect_local_ip(const char *ifname)
     close(fd);
 }
 
+/* Learn the TAP's own MAC (see g_tap_mac). */
+static void detect_tap_mac(const char *ifname)
+{
+#ifdef __APPLE__
+    struct ifaddrs *ifa_list, *ifa;
+    if (getifaddrs(&ifa_list) != 0) return;
+    for (ifa = ifa_list; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_LINK ||
+            strcmp(ifa->ifa_name, ifname) != 0)
+            continue;
+        const struct sockaddr_dl *sdl = (const struct sockaddr_dl *)ifa->ifa_addr;
+        if (sdl->sdl_alen == 6) {
+            memcpy(g_tap_mac, LLADDR(sdl), 6);
+            g_have_tap_mac = 1;
+        }
+        break;
+    }
+    freeifaddrs(ifa_list);
+#else
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return;
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+    if (ioctl(fd, SIOCGIFHWADDR, &ifr) == 0) {
+        memcpy(g_tap_mac, ifr.ifr_hwaddr.sa_data, 6);
+        g_have_tap_mac = 1;
+    }
+    close(fd);
+#endif
+    if (g_have_tap_mac)
+        fprintf(stderr, "tap_bridge: TAP MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
+                g_tap_mac[0], g_tap_mac[1], g_tap_mac[2],
+                g_tap_mac[3], g_tap_mac[4], g_tap_mac[5]);
+}
+
 /* Inject a gratuitous ARP reply into the TAP device so the Linux kernel
  * learns the IP-MAC mapping immediately, without needing to send its own
  * ARP request through the tunnel (which takes ~1-2s and drops the first ping).
@@ -824,6 +912,9 @@ static void inject_gratuitous_arp(const uint8_t ip[4], const uint8_t mac[6])
 static void arp_cache_update(const uint8_t ip[4], const uint8_t mac[6])
 {
     if (g_have_local_ip && memcmp(ip, g_local_ip, 4) == 0) return;
+    /* The host itself: answering its own ARP probes would look like an
+     * address conflict to it. */
+    if (g_have_tap_mac && memcmp(mac, g_tap_mac, 6) == 0) return;
 
     time_t now = time(NULL);
 
@@ -974,8 +1065,18 @@ static int process_incoming_frame(int fd, uint8_t *buf, uint16_t *out_len)
         return 0;
 
     if (tap_write(buf, len) != (ssize_t)len) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
+        /* A full queue or a frame the interface won't take is a lost packet,
+         * as on a real NIC, not a reason to stop: macOS's NDRV send reports
+         * ENOBUFS whenever feth's output queue overflows during a burst. */
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS ||
+            errno == ENOMEM || errno == EMSGSIZE || errno == ENETDOWN ||
+            errno == EHOSTUNREACH || errno == EINTR) {
+            static unsigned long tap_drops = 0;
+            if (++tap_drops <= 5 || (tap_drops % 1000) == 0)
+                fprintf(stderr, "tap_bridge: TAP write dropped frame #%lu (%u bytes): %s\n",
+                        tap_drops, len, strerror(errno));
             return 0;
+        }
         perror("tap_bridge: write to TAP");
         __atomic_store_n(&running, 0, __ATOMIC_SEQ_CST);
         return -1;
@@ -1129,6 +1230,17 @@ static void *outgoing_thread(void *arg)
         memcpy(combined + 2, buf, len);
         uint16_t total_len = 2 + len;
 
+        /* Frames still queued from an earlier EAGAIN go first: writing this
+         * one past them would reorder TCP segments (dup-ACKs, retransmits,
+         * stutter) — common on macOS, whose 64 KiB pipes can't be enlarged. */
+        int backlog = __atomic_load_n(&g_retry_head, __ATOMIC_RELAXED) !=
+                      __atomic_load_n(&g_retry_tail, __ATOMIC_RELAXED);
+        if (backlog) {
+            if (retry_ring_push(combined, total_len) < 0)
+                fprintf(stderr, "tap_bridge: retry ring full, dropped outgoing frame (%u bytes)\n", len);
+            continue;  /* replicas would overtake the backlog too */
+        }
+
         if (write_exact(g_b2d_fd, combined, total_len) < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 if (retry_ring_push(combined, total_len) < 0) {
@@ -1172,29 +1284,33 @@ int main(int argc, char *argv[])
     g_tap_fd = tap_fd;
 
     detect_local_ip(dev_name);
+    detect_tap_mac(dev_name);
+
+    const char *sudo_uid = getenv("SUDO_UID");
+    g_owner_uid = (geteuid() == 0 && sudo_uid) ? (uid_t)atoi(sudo_uid) : geteuid();
 
     /* Create FIFOs */
-    create_fifos();
+    if (create_fifos() < 0) { close(tap_fd); return 1; }
 
     fprintf(stderr, "tap_bridge: opening FIFOs (will block until driver connects)...\n");
 
     /* Open the d2b read ends first (non-blocking) so the driver can open the
      * matching write ends without blocking when it starts up. */
-    int d2b_high_fd = open(FIFO_D2B_HIGH, O_RDONLY | O_NONBLOCK);
+    int d2b_high_fd = open(FIFO_D2B_HIGH, O_RDONLY | O_NONBLOCK | O_NOFOLLOW);
     if (d2b_high_fd < 0) { perror("open d2b_high"); close(tap_fd); return 1; }
 #ifdef F_SETPIPE_SZ  /* Linux only; macOS pipes grow to 64 KiB on their own */
     if (fcntl(d2b_high_fd, F_SETPIPE_SZ, 256 * 1024) < 0)
         perror("tap_bridge: fcntl high pipe size");
 #endif
 
-    int d2b_low_fd = open(FIFO_D2B_LOW, O_RDONLY | O_NONBLOCK);
+    int d2b_low_fd = open(FIFO_D2B_LOW, O_RDONLY | O_NONBLOCK | O_NOFOLLOW);
     if (d2b_low_fd < 0) { perror("open d2b_low"); close(tap_fd); close(d2b_high_fd); return 1; }
 #ifdef F_SETPIPE_SZ
     if (fcntl(d2b_low_fd, F_SETPIPE_SZ, 1024 * 1024) < 0)
         perror("tap_bridge: fcntl low pipe size");
 #endif
 
-    int b2d_fd = open(FIFO_B2D, O_WRONLY);
+    int b2d_fd = open(FIFO_B2D, O_WRONLY | O_NOFOLLOW);
     if (b2d_fd < 0) { perror("open b2d"); close(tap_fd); close(d2b_high_fd); close(d2b_low_fd); return 1; }
     int flags = fcntl(b2d_fd, F_GETFL, 0);
     if (flags >= 0) fcntl(b2d_fd, F_SETFL, flags | O_NONBLOCK);
